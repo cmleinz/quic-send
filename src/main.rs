@@ -50,7 +50,7 @@ async fn main() {
             f.write_all(&priv_key).await.unwrap();
         }
         "server" => {
-            let sockaddr = "0.0.0.0:1234".parse().unwrap();
+            let sockaddr = "0.0.0.0:8080".parse().unwrap();
 
             // let mut server_config = ServerConfig::default();
             // server_config.transport = Arc::new(transport_config);
