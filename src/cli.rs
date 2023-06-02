@@ -23,7 +23,6 @@ pub struct Cli {
 pub enum Commands {
     Sender {
         file: PathBuf,
-        #[clap(short, long = "destination")]
         destination: std::net::SocketAddr,
     },
 
