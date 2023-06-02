@@ -51,15 +51,18 @@ async fn run_server(addr: SocketAddr, save_path: PathBuf) -> Result<()> {
 }
 
 async fn run_client(server_addr: SocketAddr, file_path: PathBuf) -> Result<()> {
-    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap())?;
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
     endpoint.set_default_client_config(configure_client());
 
+    println!("Attempting to connect to server {:?}", server_addr);
     // connect to server
     let (mut sender, _recv) = endpoint
         .connect(server_addr, "localhost")?
         .await?
         .open_bi()
         .await?;
+
+    println!("Connected to server");
 
     let mut file = tokio::fs::File::open(file_path).await?;
 
