@@ -1,167 +1,104 @@
-use std::{
-    env::args,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
-use humansize::{file_size_opts, FileSize};
-
-use futures_util::StreamExt;
-use rustls::PrivateKey;
-use tokio::{
-    fs::File,
-    io::{self, AsyncWriteExt},
-    time::sleep,
-};
-
-const CERT: &[u8] = include_bytes!("../cert.der");
-const PRIV: &[u8] = include_bytes!("../cert.priv");
+use anyhow::Result;
+use clap::Parser;
+use cli::{Cli, Commands};
+use quinn::{ClientConfig, Endpoint, ServerConfig};
+mod cli;
 
 #[tokio::main]
-async fn main() {
-    pretty_env_logger::init();
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
 
-    let args = args().collect::<Vec<_>>();
-
-    // according to the source code,
-    // datagram_receive_buffer_size = stream_receive_window = max_bandwidth * rtt
-    // send_window = stream_receive_window * 8
-    // const MAX_BW: u64 = 1_000_000_000 / 8; // 1gbps
-    // const RTT_MS: u64 = 300;
-    // let transport_config = TransportConfig::default();
-    // transport_config
-    //     .stream_receive_window(MAX_BW / 1000 * RTT_MS)
-    //     .unwrap()
-    //     .datagram_receive_buffer_size(Some((MAX_BW / 1000 * RTT_MS).try_into().unwrap()))
-    //     .send_window(MAX_BW / 1000 * RTT_MS * 8);
-
-    match args[1].as_str() {
-        // this is just done once to generate certs, which are then included into the binary with the above include's
-        "certgen" => {
-            let cert =
-                rcgen::generate_simple_self_signed(vec!["quic-file-transfer".into()]).unwrap();
-            let cert_der = cert.serialize_der().unwrap();
-            let priv_key = cert.serialize_private_key_der();
-
-            let mut f = File::create("cert.der").await.unwrap();
-            f.write_all(&cert_der).await.unwrap();
-
-            let mut f = File::create("cert.priv").await.unwrap();
-            f.write_all(&priv_key).await.unwrap();
-        }
-        "server" => {
-            let sockaddr = "0.0.0.0:8080".parse().unwrap();
-
-            // let mut server_config = ServerConfig::default();
-            // server_config.transport = Arc::new(transport_config);
-            let crypto_cfg = rustls::ServerConfig::builder()
-                .with_safe_defaults()
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![rustls::Certificate(CERT.into())],
-                    PrivateKey(PRIV.into()),
-                )
-                .unwrap();
-
-            let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto_cfg));
-
-            let (_endpoint, mut incoming) = quinn::Endpoint::server(server_cfg, sockaddr).unwrap();
-
-            let mut nc = incoming.next().await.unwrap().await.unwrap();
-
-            let connection = nc.connection;
-            tokio::spawn(async move {
-                // let mut last_stream = 0;
-                // let max_d = connection.max_datagram_size().unwrap() as u64;
-                loop {
-                    let stats = connection.stats();
-                    eprintln!("{:?}", stats);
-                    // This doesn't actually get proper rate. I don't think it's exposed.
-                    // eprintln!(
-                    //     "{} MB/s",
-                    //     (max_d * (stats.frame_rx.stream - last_stream)) as f64 / 1e6
-                    // );
-                    // last_stream = stats.frame_rx.stream;
-                    sleep(Duration::from_secs(1)).await;
-                }
-            });
-
-            eprintln!("Got connection");
-
-            let (_s, mut r) = nc.bi_streams.next().await.unwrap().unwrap();
-
-            eprintln!("Got stream");
-
-            let mut stdout = tokio::io::stdout();
-
-            let begin = Instant::now();
-            let bytes = io::copy(&mut r, &mut stdout).await.unwrap();
-            let end = Instant::now();
-
-            eprintln!(
-                "Received {} in {:?}, {:.4} MB/s",
-                bytes.file_size(file_size_opts::CONVENTIONAL).unwrap(),
-                end - begin,
-                bytes as f64 / (end - begin).as_secs_f64() / 1e6
-            )
-        }
-        "client" => {
-            let mut root_store = rustls::RootCertStore::empty();
-            root_store.add(&rustls::Certificate(CERT.into())).unwrap();
-
-            let client_crypto = rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-
-            // cfg_builder
-            //     .add_certificate_authority(Certificate::from_der(CERT).unwrap())
-            //     .unwrap()
-            //     .enable_0rtt();
-
-            // client_cfg.transport = Arc::new(transport_config);
-            let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
-            endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(client_crypto)));
-
-            let conn = endpoint
-                .connect(
-                    format!("{}:1234", args[2]).parse().unwrap(),
-                    "quic-file-transfer",
-                )
-                .unwrap()
-                .await
-                .unwrap();
-
-            eprintln!("Got connection");
-
-            let (mut s, _r) = conn.connection.open_bi().await.unwrap();
-
-            let c_arc = Arc::new(conn.connection);
-            let c_arc2 = c_arc.clone();
-            tokio::spawn(async move {
-                loop {
-                    eprintln!("{:?}", c_arc2.stats());
-                    sleep(Duration::from_secs(1)).await;
-                }
-            });
-
-            eprintln!("Got stream");
-
-            let mut stdin = tokio::io::stdin();
-
-            let begin = Instant::now();
-            let bytes = io::copy(&mut stdin, &mut s).await.unwrap();
-            let end = Instant::now();
-
-            s.finish().await.unwrap();
-            c_arc.close(0u32.into(), b"done");
-            eprintln!(
-                "Sent {} in {:?}, {:.4} MB/s",
-                bytes.file_size(file_size_opts::CONVENTIONAL).unwrap(),
-                end - begin,
-                bytes as f64 / (end - begin).as_secs_f64() / 1e6
-            )
-        }
-        e => panic!("Bad config {}", e),
+    match cli.commands {
+        Commands::Sender { file, destination } => run_client(destination, file).await,
+        Commands::Receiver { file, listen } => run_server(listen, file).await,
     }
+}
+
+/// Returns default server configuration along with its certificate.
+fn configure_server() -> Result<(ServerConfig, Vec<u8>)> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_der = cert.serialize_der().unwrap();
+    let priv_key = cert.serialize_private_key_der();
+    let priv_key = rustls::PrivateKey(priv_key);
+    let cert_chain = vec![rustls::Certificate(cert_der.clone())];
+
+    let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
+    let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
+    transport_config.max_concurrent_uni_streams(0_u8.into());
+
+    Ok((server_config, cert_der))
+}
+
+pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, Vec<u8>)> {
+    let (server_config, server_cert) = configure_server()?;
+    let endpoint = Endpoint::server(server_config, bind_addr)?;
+    Ok((endpoint, server_cert))
+}
+
+/// Runs a QUIC server bound to given address.
+async fn run_server(addr: SocketAddr, save_path: PathBuf) -> Result<()> {
+    let (endpoint, _server_cert) = make_server_endpoint(addr)?;
+    // accept a single connection
+    if let Some(conn) = endpoint.accept().await {
+        let (_, mut receiver) = conn.await?.accept_bi().await?;
+        let mut file = tokio::fs::File::create(save_path).await?;
+
+        tokio::io::copy(&mut receiver, &mut file).await?;
+    }
+    Ok(())
+}
+
+async fn run_client(server_addr: SocketAddr, file_path: PathBuf) -> Result<()> {
+    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap())?;
+    endpoint.set_default_client_config(configure_client());
+
+    // connect to server
+    let (mut sender, _recv) = endpoint
+        .connect(server_addr, "localhost")?
+        .await?
+        .open_bi()
+        .await?;
+
+    let mut file = tokio::fs::File::open(file_path).await?;
+
+    tokio::io::copy(&mut file, &mut sender).await?;
+    // Make sure the server has a chance to clean up
+    endpoint.wait_idle().await;
+
+    Ok(())
+}
+
+/// Dummy certificate verifier that treats any certificate as valid.
+/// NOTE, such verification is vulnerable to MITM attacks, but convenient for testing.
+struct SkipServerVerification;
+
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+}
+
+impl rustls::client::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
+
+fn configure_client() -> ClientConfig {
+    let crypto = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(SkipServerVerification::new())
+        .with_no_client_auth();
+
+    ClientConfig::new(Arc::new(crypto))
 }
