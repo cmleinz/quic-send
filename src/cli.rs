@@ -28,8 +28,8 @@ pub enum Commands {
     },
 
     Receiver {
-        file: PathBuf,
         #[clap(short, long = "listen", default_value = "[::1]:4433")]
         listen: std::net::SocketAddr,
+        file: PathBuf,
     },
 }
